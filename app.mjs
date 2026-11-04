@@ -1,18 +1,18 @@
 import express from 'express';
 import { mailResponse } from './controllers/response.mjs';
 import { createMailController } from './controllers/mailx.mjs';
-import { basicAuth } from './middleware/basicAuth.mjs';
+import { createAuthorizer } from './middleware/authorize.mjs';
 import { createMailRouter } from './routes/mailRoutes.mjs';
 import { createMailer } from './services/mailer.mjs';
 
-export function createApp(config, logger, mailer = createMailer(config, logger)) {
+export function createApp(config, logger, { mailer = createMailer(config, logger), fetchFn } = {}) {
   const app = express();
   app.disable('x-powered-by');
 
   const controller = createMailController({ config, mailer, logger });
   // `/health` is what the Helm liveness and readiness probes call.
   app.get(['/health', '/healthz'], (_req, res) => res.json({ status: 'ok' }));
-  app.use(createMailRouter(controller, express.json({ limit: config.MAIL_BODY_LIMIT }), basicAuth(config, logger)));
+  app.use(createMailRouter(controller, express.json({ limit: config.MAIL_BODY_LIMIT }), createAuthorizer(config, logger, fetchFn)));
 
   app.use((_req, res) => res.status(404).json({ error: 'Not found' }));
 

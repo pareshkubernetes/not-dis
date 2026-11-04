@@ -17,15 +17,16 @@ export function isAddress(value) {
 /** Splits, validates and de-duplicates (case-insensitive). An address keeps its first role: to, then cc, then bcc. */
 export function collectRecipients({ to, cc, bcc }) {
   const seen = new Set();
-  const invalid = [];
   const roles = { to: [], cc: [], bcc: [] };
+  const NOT_VALID = {
+    to: 'Receiver email address is not valid',
+    cc: 'CC email address is not valid',
+    bcc: 'BCC email address is not valid',
+  };
 
   for (const [role, raw] of [['to', to], ['cc', cc], ['bcc', bcc]]) {
     for (const address of splitAddresses(raw)) {
-      if (!isAddress(address)) {
-        invalid.push(address.slice(0, 80));
-        continue;
-      }
+      if (!isAddress(address)) throw new AppError(400, NOT_VALID[role]);
       const key = address.toLowerCase();
       if (seen.has(key)) continue;
       seen.add(key);
@@ -33,10 +34,7 @@ export function collectRecipients({ to, cc, bcc }) {
     }
   }
 
-  if (invalid.length) {
-    throw new AppError(400, `Invalid recipient address: ${invalid.slice(0, 5).join(', ')}`);
-  }
-  if (seen.size === 0) throw new AppError(400, 'No recipients provided.');
+  if (seen.size === 0) throw new AppError(400, NOT_VALID.to);
   return roles;
 }
 

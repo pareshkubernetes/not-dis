@@ -69,6 +69,14 @@ export function decodeAttachments(files, config, bodyBytes) {
     return { filename, content, size: (content.length / 4) * 3 - padding };
   });
 
+  const totalBytes = prepared.reduce((sum, f) => sum + f.size, 0);
+  if (totalBytes > config.MAIL_MAX_ATTACHMENT_BYTES) {
+    throw new AppError(
+      413,
+      `The attachments are too large: ${megabytes(totalBytes)} in total, but the limit is ${megabytes(config.MAIL_MAX_ATTACHMENT_BYTES)}.`,
+    );
+  }
+
   const estimated =
     HEADER_ALLOWANCE +
     encodedSize(bodyBytes) +

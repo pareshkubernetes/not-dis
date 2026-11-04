@@ -3,6 +3,9 @@ import { AppError } from '../errors.mjs';
 import { isAddress } from '../services/recipients.mjs';
 import { mailResponse } from './response.mjs';
 
+const DEFAULT_SUBJECT = 'Orion Notification email';
+const DEFAULT_MESSAGE = 'This is auto-generated email from Orion as acknowledgement for your order placed there.';
+
 const list = z.union([z.string(), z.array(z.string())]).optional();
 const noLineBreaks = (value) => !/[\r\n]/.test(value);
 
@@ -15,10 +18,10 @@ const requestSchema = z.object({
   bcc: list,
   subject: z
     .string()
-    .max(500)
+    .max(512)
     .refine(noLineBreaks, 'must not contain line breaks')
     .optional()
-    .transform((v) => v || 'No Subject'),
+    .transform((v) => v || DEFAULT_SUBJECT),
   emailMessage: z.string().optional(),
   body: z.string().optional(),
   isHtml: z
@@ -45,8 +48,7 @@ function parseRequest(body, config) {
   }
   const input = parsed.data;
   const from = input.sender || config.NOTIFICATION_SENDER;
-  if (!from) throw new AppError(400, 'No sender provided.');
-  if (!isAddress(from)) throw new AppError(400, `Invalid sender address: ${from.slice(0, 80)}`);
+  if (!from || !isAddress(from)) throw new AppError(400, 'Sender email address is not valid');
 
   return {
     from,
@@ -54,7 +56,7 @@ function parseRequest(body, config) {
     cc: input.cc,
     bcc: input.bcc,
     subject: input.subject,
-    text: input.emailMessage ?? input.body ?? '',
+    text: input.emailMessage || input.body || DEFAULT_MESSAGE,
     isHtml: input.isHtml,
     attachedFiles: input.attachedFiles,
   };
@@ -66,11 +68,14 @@ export function createMailController({ config, mailer, logger }) {
   return {
     async send(req, res) {
       const endpoint = req.path;
+      let echo = req.body;
       const respond = (status, message, success, batchResults) =>
-        res.status(status).json(mailResponse(endpoint, req.body, config, message, success, batchResults));
+        res.status(status).json(mailResponse(endpoint, echo, config, message, success, batchResults));
 
       try {
+        if (!req.body || Object.keys(req.body).length === 0) throw new AppError(400, 'Data not found to send email.');
         const request = parseRequest(req.body, config);
+        echo = { ...req.body, subject: request.subject };
         const outcome = await mailer.send(request);
 
         const breakdown =
@@ -91,7 +96,7 @@ export function createMailController({ config, mailer, logger }) {
               : 'Email batch sent successfully.';
           return mailResponse(
             endpoint,
-            { ...req.body, receiver: batch.to, cc: batch.cc, bcc: batch.bcc, subject: request.subject },
+            { ...echo, receiver: batch.to, cc: batch.cc, bcc: batch.bcc },
             config,
             `${detail} ${breakdown}`,
             batchOk,

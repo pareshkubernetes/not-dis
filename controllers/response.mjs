@@ -9,7 +9,7 @@ export function mailResponse(endpoint, body, config, emailSendResponse, emailSuc
     emailReceiver: text(input.receiver ?? input.to),
     emailCC: text(input.cc),
     emailBCC: text(input.bcc),
-    emailSubject: typeof input.subject === 'string' && input.subject ? input.subject : 'No Subject',
+    emailSubject: typeof input.subject === 'string' ? input.subject : '',
     emailInHtml: input.isHtml === true || input.isHtml === 'true',
     emailSendResponse,
     emailSuccess,

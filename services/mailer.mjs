@@ -15,7 +15,12 @@ export function createMailer(config, logger, transport = deliver) {
       const bodyBytes = Buffer.byteLength(text, 'utf8');
       const { attachments, rawBytes } = decodeAttachments(attachedFiles, config, bodyBytes);
       const content = composeContent({ text, isHtml, attachments });
-      const plan = planBatches(recipients, config.MAIL_BATCH_SIZE);
+      // The gateway accepts only a few recipients per large message, so big messages get smaller batches.
+      const large = content.body.length >= config.MAIL_LARGE_MESSAGE_BYTES;
+      const batchSize = large
+        ? Math.min(config.MAIL_BATCH_SIZE, config.MAIL_LARGE_MESSAGE_MAX_RECIPIENTS)
+        : config.MAIL_BATCH_SIZE;
+      const plan = planBatches(recipients, batchSize);
 
       const batches = plan.map((batch) => ({ ...batch, ok: false, reason: 'Not attempted.', rejected: [] }));
       const outcome = { bodyBytes, attachmentBytes: rawBytes, mimeBytes: 0, batches };
