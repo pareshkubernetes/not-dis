@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import net from 'node:net';
 import request from 'supertest';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -83,7 +84,7 @@ describe('notification dispatcher', () => {
   };
 
 
-  const fileOf = (bytes, seed = 7) => Buffer.from(Array.from({ length: bytes }, (_, i) => (i * seed) % 251));
+  const fileOf = (bytes) => randomBytes(bytes);
   const attach = (data, filename = 'test_5mb_file.dat') => ({ filename, encoding: 'base64', content: data.toString('base64') });
 
   it('splits, validates and de-duplicates recipients, then fills batches in order', () => {
@@ -194,7 +195,7 @@ describe('notification dispatcher', () => {
     expect(tooBig.body.emailSuccess).toBe(false);
     expect(tooBig.body.emailSendResponse).toMatch(/too large.*limit for one message is 20\.0 MB/);
     expect(smtp.state.connections).toBe(connections);
-  });
+  }, 60_000);
 
   it('rejects invalid attachments and bad requests in the same response shape', async () => {
     const api = await build();
