@@ -1,0 +1,23 @@
+{
+  "name": "notification-dispatcher",
+  "version": "1.0.0",
+  "description": "HTTP service that delivers notification email over SMTP",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20.12"
+  },
+  "scripts": {
+    "start": "node server.mjs",
+    "dev": "node --watch server.mjs",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "express": "^4.22.3",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "supertest": "^7.3.1",
+    "vitest": "^5.0.5"
+  }
+}
