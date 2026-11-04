@@ -14,7 +14,7 @@ export function basicAuth(config) {
     const supplied = scheme?.toLowerCase() === 'basic' && encoded ? Buffer.from(encoded, 'base64').toString() : '';
     if (!timingSafeEqual(digest(supplied), expected)) {
       res.set('WWW-Authenticate', 'Basic realm="notification-dispatcher"');
-      return next(new AppError(401, 'Authentication required.'));
+      return next(new AppError(401, 'Authorization failed. Please check your credentials or token.'));
     }
     next();
   };

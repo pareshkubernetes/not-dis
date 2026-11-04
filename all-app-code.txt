@@ -1,0 +1,1262 @@
+# all-app-code.txt - notification-dispatcher
+# In an empty folder, next to recreate-app.sh:   bash recreate-app.sh -f
+
+@@FILE .env.example
+# ---- HTTP ----
+PORT=3000
+NODE_ENV=development
+LOG_LEVEL=info
+
+# ---- Callers (optional) ----
+# When both are set, every request must carry matching Basic credentials.
+NOTIFICATION_EMAIL_USERNAME=
+NOTIFICATION_EMAIL_PASSWORD=
+# Used when a request does not name a sender.
+NOTIFICATION_SENDER=noreply@example.com
+
+# ---- SMTP ----
+SMTP_HOST=smtp.example.com
+SMTP_PORT=25
+# true = implicit TLS (port 465). Otherwise STARTTLS is used when the server offers it.
+SMTP_SECURE=false
+SMTP_STARTTLS=true
+SMTP_TLS_REJECT_UNAUTHORIZED=true
+SMTP_USER=
+SMTP_PASSWORD=
+SMTP_TIMEOUT_MS=30000
+
+# ---- Delivery limits ----
+# Recipients (to + cc + bcc) per SMTP message. 1-300.
+MAIL_BATCH_SIZE=100
+# Largest message after base64 encoding, in bytes (default 20 MiB, max 25 MiB).
+MAIL_MAX_MESSAGE_BYTES=20971520
+MAIL_MAX_ATTACHMENTS=10
+# Attachments arrive as base64 inside the JSON request, so keep this above MAIL_MAX_MESSAGE_BYTES.
+MAIL_BODY_LIMIT=30mb
+@@END
+@@FILE .gitignore
+node_modules
+.env
+*.log
+@@END
+@@FILE app.mjs
+import express from 'express';
+import { mailResponse } from './controllers/response.mjs';
+import { createMailController } from './controllers/mailx.mjs';
+import { basicAuth } from './middleware/basicAuth.mjs';
+import { createMailRouter } from './routes/mailRoutes.mjs';
+import { createMailer } from './services/mailer.mjs';
+
+export function createApp(config, logger, mailer = createMailer(config, logger)) {
+  const app = express();
+  app.disable('x-powered-by');
+
+  const controller = createMailController({ config, mailer, logger });
+  app.get('/healthz', (_req, res) => res.json({ status: 'ok' }));
+  app.use(createMailRouter(controller, express.json({ limit: config.MAIL_BODY_LIMIT }), basicAuth(config)));
+
+  app.use((_req, res) => res.status(404).json({ error: 'Not found' }));
+
+  app.use((error, req, res, _next) => {
+    let status = error.status ?? 500;
+    let message = error.message;
+    if (error.type === 'entity.parse.failed') {
+      status = 400;
+      message = 'Request body is not valid JSON.';
+    } else if (error.type === 'entity.too.large') {
+      status = 413;
+      message = 'Request body is too large.';
+    } else if (!error.status) {
+      logger.error('http.unhandled', { path: req.path, error: error.message });
+      message = 'Unexpected error while sending the email.';
+    }
+    res.status(status).json(mailResponse(req.path, req.body, config, message, false));
+  });
+
+  return app;
+}
+@@END
+@@FILE config.mjs
+import { z } from 'zod';
+
+const MiB = 1024 * 1024;
+
+const flag = (fallback) =>
+  z
+    .enum(['true', 'false'])
+    .optional()
+    .transform((v) => (v ?? fallback) === 'true');
+
+const int = (fallback, min, max) => z.coerce.number().int().min(min).max(max).default(fallback);
+
+const schema = z
+  .object({
+    NODE_ENV: z.string().default('development'),
+    PORT: int(3000, 1, 65535),
+    LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error', 'silent']).default('info'),
+
+    NOTIFICATION_EMAIL_USERNAME: z.string().optional(),
+    NOTIFICATION_EMAIL_PASSWORD: z.string().optional(),
+    NOTIFICATION_SENDER: z.email().optional(),
+
+    SMTP_HOST: z.string().min(1),
+    SMTP_PORT: int(25, 1, 65535),
+    SMTP_SECURE: flag('false'),
+    SMTP_STARTTLS: flag('true'),
+    SMTP_TLS_REJECT_UNAUTHORIZED: flag('true'),
+    SMTP_USER: z.string().optional(),
+    SMTP_PASSWORD: z.string().optional(),
+    SMTP_TIMEOUT_MS: int(30_000, 1_000, 300_000),
+
+    MAIL_BATCH_SIZE: int(100, 1, 300),
+    MAIL_MAX_MESSAGE_BYTES: int(20 * MiB, MiB, 25 * MiB),
+    MAIL_MAX_ATTACHMENTS: int(10, 1, 20),
+    // Attachments travel inside the JSON body as base64 (+33%), so this must exceed MAIL_MAX_MESSAGE_BYTES.
+    MAIL_BODY_LIMIT: z.string().default('30mb'),
+  })
+  .refine((c) => Boolean(c.SMTP_USER) === Boolean(c.SMTP_PASSWORD), {
+    message: 'SMTP_USER and SMTP_PASSWORD must be set together',
+    path: ['SMTP_PASSWORD'],
+  })
+  .refine((c) => Boolean(c.NOTIFICATION_EMAIL_USERNAME) === Boolean(c.NOTIFICATION_EMAIL_PASSWORD), {
+    message: 'NOTIFICATION_EMAIL_USERNAME and NOTIFICATION_EMAIL_PASSWORD must be set together',
+    path: ['NOTIFICATION_EMAIL_PASSWORD'],
+  });
+
+export function loadConfig(env = process.env) {
+  const present = Object.fromEntries(Object.entries(env).filter(([, v]) => v !== undefined && v !== ''));
+  const parsed = schema.safeParse(present);
+  if (!parsed.success) {
+    const detail = parsed.error.issues.map((i) => `${i.path.join('.') || 'env'}: ${i.message}`).join('; ');
+    throw new Error(`Invalid configuration: ${detail}`);
+  }
+  return Object.freeze(parsed.data);
+}
+@@END
+@@FILE controllers/mailx.mjs
+import { z } from 'zod';
+import { AppError } from '../errors.mjs';
+import { isAddress } from '../services/recipients.mjs';
+import { mailResponse } from './response.mjs';
+
+const list = z.union([z.string(), z.array(z.string())]).optional();
+const noLineBreaks = (value) => !/[\r\n]/.test(value);
+
+const requestSchema = z.object({
+  sender: z.string().trim().optional(),
+  receiver: list,
+  to: list,
+  receiverName: z.string().optional(),
+  cc: list,
+  bcc: list,
+  subject: z
+    .string()
+    .max(500)
+    .refine(noLineBreaks, 'must not contain line breaks')
+    .optional()
+    .transform((v) => v || 'No Subject'),
+  emailMessage: z.string().optional(),
+  body: z.string().optional(),
+  isHtml: z
+    .union([z.boolean(), z.enum(['true', 'false']).transform((v) => v === 'true')])
+    .optional()
+    .transform((v) => v ?? false),
+  attachedFiles: z
+    .array(
+      z.object({
+        filename: z.string().min(1),
+        encoding: z.literal('base64').optional(),
+        content: z.string().min(1),
+      }),
+    )
+    .nullish()
+    .transform((v) => v ?? []),
+});
+
+function parseRequest(body, config) {
+  const parsed = requestSchema.safeParse(body);
+  if (!parsed.success) {
+    const detail = parsed.error.issues.map((i) => `${i.path.join('.') || 'body'} ${i.message}`).join('; ');
+    throw new AppError(400, `Invalid request: ${detail}`);
+  }
+  const input = parsed.data;
+  const from = input.sender || config.NOTIFICATION_SENDER;
+  if (!from) throw new AppError(400, 'No sender provided.');
+  if (!isAddress(from)) throw new AppError(400, `Invalid sender address: ${from.slice(0, 80)}`);
+
+  return {
+    from,
+    to: input.receiver ?? input.to,
+    cc: input.cc,
+    bcc: input.bcc,
+    subject: input.subject,
+    text: input.emailMessage ?? input.body ?? '',
+    isHtml: input.isHtml,
+    attachedFiles: input.attachedFiles,
+  };
+}
+
+const megabytes = (bytes) => `${(bytes / 1048576).toFixed(2)}MB`;
+
+export function createMailController({ config, mailer, logger }) {
+  return {
+    async send(req, res) {
+      const endpoint = req.path;
+      const respond = (status, message, success, batchResults) =>
+        res.status(status).json(mailResponse(endpoint, req.body, config, message, success, batchResults));
+
+      try {
+        const request = parseRequest(req.body, config);
+        const outcome = await mailer.send(request);
+
+        const breakdown =
+          `[Payload Breakdown: Body: ${megabytes(outcome.bodyBytes)}, ` +
+          `Attachments: ${megabytes(outcome.attachmentBytes)}, Total Message MIME: ${megabytes(outcome.mimeBytes)}]`;
+        const failed = outcome.batches.filter((b) => !b.ok || b.rejected.length > 0);
+        const ok = failed.length === 0;
+
+        const batchResults = outcome.batches.map((batch) => {
+          const batchOk = batch.ok && batch.rejected.length === 0;
+          const detail = !batch.ok
+            ? `Email batch failed: ${batch.reason}`
+            : batch.rejected.length
+              ? `Email batch sent, but ${batch.rejected.length} recipient(s) were rejected by the mail server (${batch.rejected
+                  .slice(0, 5)
+                  .map((r) => r.address)
+                  .join(', ')}).`
+              : 'Email batch sent successfully.';
+          return mailResponse(
+            endpoint,
+            { ...req.body, receiver: batch.to, cc: batch.cc, bcc: batch.bcc, subject: request.subject },
+            config,
+            `${detail} ${breakdown}`,
+            batchOk,
+          );
+        });
+
+        const message = ok
+          ? `All email batches processed successfully. ${breakdown}`
+          : `Some email batches failed (${failed.length} of ${outcome.batches.length}). ${failed
+              .slice(0, 3)
+              .map((b) => `Batch ${outcome.batches.indexOf(b) + 1}: ${b.reason || `${b.rejected.length} recipient(s) rejected`}`)
+              .join(' | ')} ${breakdown}`;
+        respond(ok ? 200 : 500, message, ok, batchResults);
+      } catch (error) {
+        if (error instanceof AppError) return respond(error.status, error.message, false);
+        logger.error('mail.request.failed', { endpoint, error: error.message });
+        respond(500, 'Unexpected error while sending the email.', false);
+      }
+    },
+  };
+}
+@@END
+@@FILE controllers/response.mjs
+const text = (value) => (Array.isArray(value) ? value.join(',') : typeof value === 'string' ? value : '');
+
+/** The response contract shared by every send endpoint. Fields echo the request; `batchResults` is added after sending. */
+export function mailResponse(endpoint, body, config, emailSendResponse, emailSuccess, batchResults) {
+  const input = body && typeof body === 'object' ? body : {};
+  const response = {
+    apiEndpoint: endpoint,
+    emailSender: typeof input.sender === 'string' && input.sender ? input.sender : (config.NOTIFICATION_SENDER ?? ''),
+    emailReceiver: text(input.receiver ?? input.to),
+    emailCC: text(input.cc),
+    emailBCC: text(input.bcc),
+    emailSubject: typeof input.subject === 'string' && input.subject ? input.subject : 'No Subject',
+    emailInHtml: input.isHtml === true || input.isHtml === 'true',
+    emailSendResponse,
+    emailSuccess,
+  };
+  return batchResults ? { ...response, batchResults } : response;
+}
+@@END
+@@FILE errors.mjs
+export class AppError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.name = 'AppError';
+    this.status = status;
+  }
+}
+@@END
+@@FILE logger.mjs
+const LEVELS = { debug: 10, info: 20, warn: 30, error: 40, silent: 100 };
+
+export function createLogger(level = 'info') {
+  const threshold = LEVELS[level] ?? LEVELS.info;
+  const emit = (name) => (msg, fields = {}) => {
+    if (LEVELS[name] < threshold) return;
+    const line = JSON.stringify({ time: new Date().toISOString(), level: name, msg, ...fields });
+    (LEVELS[name] >= LEVELS.warn ? process.stderr : process.stdout).write(`${line}\n`);
+  };
+  return { debug: emit('debug'), info: emit('info'), warn: emit('warn'), error: emit('error') };
+}
+@@END
+@@FILE middleware/basicAuth.mjs
+import { createHash, timingSafeEqual } from 'node:crypto';
+import { AppError } from '../errors.mjs';
+
+const digest = (value) => createHash('sha256').update(value).digest();
+
+/** Enforced only when NOTIFICATION_EMAIL_USERNAME / NOTIFICATION_EMAIL_PASSWORD are configured. */
+export function basicAuth(config) {
+  const { NOTIFICATION_EMAIL_USERNAME: username, NOTIFICATION_EMAIL_PASSWORD: password } = config;
+  if (!username || !password) return (_req, _res, next) => next();
+
+  const expected = digest(`${username}:${password}`);
+  return (req, res, next) => {
+    const [scheme, encoded] = (req.headers.authorization ?? '').split(' ');
+    const supplied = scheme?.toLowerCase() === 'basic' && encoded ? Buffer.from(encoded, 'base64').toString() : '';
+    if (!timingSafeEqual(digest(supplied), expected)) {
+      res.set('WWW-Authenticate', 'Basic realm="notification-dispatcher"');
+      return next(new AppError(401, 'Authorization failed. Please check your credentials or token.'));
+    }
+    next();
+  };
+}
+@@END
+@@FILE package.json
+{
+  "name": "notification-dispatcher",
+  "version": "1.0.0",
+  "description": "HTTP service that delivers notification email over SMTP",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20.12"
+  },
+  "scripts": {
+    "start": "node server.mjs",
+    "dev": "node --watch server.mjs",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "express": "^4.22.3",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "supertest": "^7.3.1",
+    "vitest": "^5.0.5"
+  }
+}
+@@END
+@@FILE recreate-app.sh
+#!/usr/bin/env bash
+# recreate-app.sh
+#
+# Writes every file stored in all-app-code.txt into the current folder (or the folder you name).
+#
+# Usage (run it in the folder where the application should be created):
+#     bash recreate-app.sh -f                    # reads ./all-app-code.txt and overwrites existing files
+#     bash recreate-app.sh -f bundle.txt         # another input file name
+#     bash recreate-app.sh bundle.txt ./out      # write into ./out (existing files that differ are kept without -f)
+#     bash recreate-app.sh -l                    # list the files in the bundle
+#     bash recreate-app.sh -n                    # dry run: show what would happen, write nothing
+#
+# Without -f, files that already exist and differ are reported and skipped.
+# The bundle is verified against its SHA-256 checksums before anything is written.
+# A bundle that was converted to Windows line endings (CRLF) by an editor or e-mail is still read correctly.
+
+set -euo pipefail
+export LC_ALL=C
+
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
+WORK=""
+# Removes only the staging folder this run created itself (its name always starts with recreate-app.).
+cleanup() {
+  case "$WORK" in
+    */recreate-app.??????) [ -d "$WORK" ] && rm -rf -- "$WORK" ;;
+  esac
+  return 0
+}
+
+usage() { sed -n '2,15p' "$SELF" | sed 's/^# \{0,1\}//'; }
+
+sha_of() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
+  else shasum -a 256 "$1" | cut -d' ' -f1
+  fi
+}
+
+main() {
+  local FORCE=0 DRY=0 LIST=0 arg
+  local POS=()
+  for arg in "$@"; do
+    case "$arg" in
+      -f|--force) FORCE=1 ;;
+      -n|--dry-run) DRY=1 ;;
+      -l|--list) LIST=1 ;;
+      -h|--help) usage; return 0 ;;
+      -*) echo "ERROR: unknown option: $arg" >&2; return 1 ;;
+      *) POS+=("$arg") ;;
+    esac
+  done
+
+  local IN="${POS[0]:-all-app-code.txt}"
+  local DEST="${POS[1]:-.}"
+  [ -f "$IN" ] || { echo "ERROR: input file not found: $IN" >&2; return 1; }
+  command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1 \
+    || { echo "ERROR: sha256sum or shasum is required" >&2; return 1; }
+
+  WORK="$(mktemp -d "${TMPDIR:-/tmp}/recreate-app.XXXXXX")"
+  trap cleanup EXIT
+
+  # Pass 1: split the bundle into a staging folder and read the checksum table.
+  local line current="" count=0 in_sums=0
+  : > "$WORK/sums"
+  : > "$WORK/files"
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
+    if [ -n "$current" ]; then
+      if [ "$line" = "@@END" ]; then current=""; continue; fi
+      printf '%s\n' "$line" >> "$WORK/stage/$current"
+      continue
+    fi
+    case "$line" in
+      "@@FILE "*)
+        current="${line#@@FILE }"
+        case "$current" in
+          /*|*..*|"") echo "ERROR: unsafe path in bundle: $current" >&2; return 1 ;;
+        esac
+        mkdir -p "$WORK/stage/$(dirname "$current")"
+        : > "$WORK/stage/$current"
+        echo "$current" >> "$WORK/files"
+        count=$((count + 1))
+        ;;
+      "@@CHECKSUMS") in_sums=1 ;;
+      *) if [ "$in_sums" = 1 ] && [ -n "$line" ]; then echo "$line" >> "$WORK/sums"; fi ;;
+    esac
+  done < "$IN"
+  [ -z "$current" ] || { echo "ERROR: bundle is truncated (missing @@END after $current)" >&2; return 1; }
+  [ "$count" -gt 0 ] || { echo "ERROR: no files found in $IN" >&2; return 1; }
+
+  if [ "$LIST" = 1 ]; then cat "$WORK/files"; echo "$count files"; return 0; fi
+
+  # Pass 2: verify every file against its checksum before anything is written.
+  local expected path actual bad=0
+  while IFS= read -r path; do
+    expected="$(awk -v p="$path" '$2 == p { print $1 }' "$WORK/sums")"
+    if [ -z "$expected" ]; then echo "ERROR: no checksum for $path" >&2; bad=1; continue; fi
+    actual="$(sha_of "$WORK/stage/$path")"
+    if [ "$actual" != "$expected" ]; then echo "ERROR: checksum mismatch: $path" >&2; bad=1; fi
+  done < "$WORK/files"
+  [ "$bad" = 0 ] || { echo "Nothing was written. Re-copy the bundle file and try again." >&2; return 1; }
+
+  # Pass 3: write.
+  local created=0 updated=0 same=0 skipped=0 target
+  while IFS= read -r path; do
+    target="$DEST/$path"
+    if [ -e "$target" ]; then
+      if cmp -s "$WORK/stage/$path" "$target"; then same=$((same + 1)); continue; fi
+      if [ "$FORCE" = 0 ]; then
+        echo "skipped (differs, use -f to overwrite): $path"
+        skipped=$((skipped + 1))
+        continue
+      fi
+      echo "update:  $path"; updated=$((updated + 1))
+    else
+      echo "create:  $path"; created=$((created + 1))
+    fi
+    if [ "$DRY" = 0 ]; then
+      mkdir -p "$(dirname "$target")"
+      cp "$WORK/stage/$path" "$target"
+    fi
+  done < "$WORK/files"
+
+  echo
+  echo "$created created, $updated updated, $same unchanged, $skipped skipped${DRY:+ }$([ "$DRY" = 1 ] && echo '(dry run, nothing written)')"
+  if [ "$DRY" = 0 ] && [ "$((created + updated))" -gt 0 ]; then
+    echo
+    echo "Next:  cd \"$DEST\" && cp .env.example .env   (then edit .env)"
+    echo "       npm install && npm start      (npm test runs the tests)"
+  fi
+}
+
+main "$@"
+exit $?
+@@END
+@@FILE routes/mailRoutes.mjs
+import { Router } from 'express';
+
+/** `/send-email/v3` is the current route; the older versions and the paths used by earlier callers stay mounted. */
+export const SEND_PATHS = ['/send-email/v3', '/send-email/v2', '/send-email/v1', '/send-mail/v2', '/send-mailx'];
+
+export function createMailRouter(controller, ...middleware) {
+  const router = Router();
+  for (const path of SEND_PATHS) router.post(path, ...middleware, controller.send);
+  return router;
+}
+@@END
+@@FILE server.mjs
+import { existsSync } from 'node:fs';
+import { createApp } from './app.mjs';
+import { loadConfig } from './config.mjs';
+import { createLogger } from './logger.mjs';
+
+if (existsSync('.env')) process.loadEnvFile('.env');
+
+const config = loadConfig();
+const logger = createLogger(config.LOG_LEVEL);
+
+const server = createApp(config, logger).listen(config.PORT, () => {
+  logger.info('server.started', { port: config.PORT, env: config.NODE_ENV });
+});
+
+const shutdown = (signal) => {
+  logger.info('server.stopping', { signal });
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(1), 10_000).unref();
+};
+process.once('SIGTERM', () => shutdown('SIGTERM'));
+process.once('SIGINT', () => shutdown('SIGINT'));
+@@END
+@@FILE services/attachments.mjs
+import path from 'node:path';
+import { AppError } from '../errors.mjs';
+
+const HEADER_ALLOWANCE = 16 * 1024;
+const PART_OVERHEAD = 1024;
+const BASE64 = /^[A-Za-z0-9+/]*={0,2}$/;
+
+const CONTENT_TYPES = {
+  '.pdf': 'application/pdf',
+  '.txt': 'text/plain',
+  '.log': 'text/plain',
+  '.csv': 'text/csv',
+  '.html': 'text/html',
+  '.json': 'application/json',
+  '.xml': 'application/xml',
+  '.yaml': 'application/yaml',
+  '.yml': 'application/yaml',
+  '.zip': 'application/zip',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.doc': 'application/msword',
+  '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  '.xls': 'application/vnd.ms-excel',
+  '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  '.ppt': 'application/vnd.ms-powerpoint',
+  '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+};
+
+/** Base64 grows data by 4/3, plus a CRLF every 76 characters (57 source bytes). */
+export const encodedSize = (bytes) => Math.ceil(bytes / 3) * 4 + Math.ceil(bytes / 57) * 2;
+
+const megabytes = (bytes) => `${(bytes / 1048576).toFixed(1)} MB`;
+
+export function messageTooLarge(estimated, limit, bodyBytes, partCount) {
+  const room = limit - HEADER_ALLOWANCE - encodedSize(bodyBytes) - partCount * PART_OVERHEAD;
+  const rawRoom = Math.max(0, Math.floor((room * 57) / 78));
+  return new AppError(
+    413,
+    `The message is too large: about ${megabytes(estimated)} once encoded, but the limit for one message is ${megabytes(limit)} ` +
+      `(roughly ${megabytes(rawRoom)} of attachments).`,
+  );
+}
+
+function cleanFilename(value) {
+  const name = path.basename(String(value).replace(/\\/g, '/')).trim();
+  if (!name || name.length > 255 || /[\x00-\x1f\x7f]/.test(name)) throw new AppError(400, 'Invalid attachment file name.');
+  return name;
+}
+
+/**
+ * Validates the inline base64 attachments and checks the encoded size from the text length alone,
+ * before anything is decoded.
+ */
+export function decodeAttachments(files, config, bodyBytes) {
+  if (files.length === 0) return { attachments: [], rawBytes: 0 };
+  if (files.length > config.MAIL_MAX_ATTACHMENTS) {
+    throw new AppError(400, `At most ${config.MAIL_MAX_ATTACHMENTS} attachments are allowed.`);
+  }
+
+  const prepared = files.map((file) => {
+    const filename = cleanFilename(file.filename);
+    const content = file.content.replace(/\s+/g, '');
+    if (content.length % 4 !== 0 || !BASE64.test(content)) {
+      throw new AppError(400, `Attachment "${filename.slice(0, 120)}" is not valid base64.`);
+    }
+    const padding = content.endsWith('==') ? 2 : content.endsWith('=') ? 1 : 0;
+    return { filename, content, size: (content.length / 4) * 3 - padding };
+  });
+
+  const estimated =
+    HEADER_ALLOWANCE +
+    encodedSize(bodyBytes) +
+    prepared.reduce((sum, f) => sum + encodedSize(f.size) + PART_OVERHEAD, 0);
+  if (estimated > config.MAIL_MAX_MESSAGE_BYTES) {
+    throw messageTooLarge(estimated, config.MAIL_MAX_MESSAGE_BYTES, bodyBytes, prepared.length + 1);
+  }
+
+  const attachments = prepared.map((f) => ({
+    filename: f.filename,
+    contentType: CONTENT_TYPES[path.extname(f.filename).toLowerCase()] ?? 'application/octet-stream',
+    data: Buffer.from(f.content, 'base64'),
+  }));
+  return { attachments, rawBytes: attachments.reduce((sum, a) => sum + a.data.length, 0) };
+}
+@@END
+@@FILE services/mailer.mjs
+import { AppError } from '../errors.mjs';
+import { decodeAttachments, messageTooLarge } from './attachments.mjs';
+import { assembleMessage, composeContent } from './mime.mjs';
+import { collectRecipients, planBatches } from './recipients.mjs';
+import { deliver } from './smtp.mjs';
+
+export function createMailer(config, logger, transport = deliver) {
+  return {
+    /**
+     * Sends one message per batch of at most MAIL_BATCH_SIZE recipients. A failed batch does not stop the
+     * remaining ones, unless the failure is the connection itself.
+     */
+    async send({ from, to, cc, bcc, subject, text, isHtml, attachedFiles }) {
+      const recipients = collectRecipients({ to, cc, bcc });
+      const bodyBytes = Buffer.byteLength(text, 'utf8');
+      const { attachments, rawBytes } = decodeAttachments(attachedFiles, config, bodyBytes);
+      const content = composeContent({ text, isHtml, attachments });
+      const plan = planBatches(recipients, config.MAIL_BATCH_SIZE);
+
+      const batches = plan.map((batch) => ({ ...batch, ok: false, reason: 'Not attempted.', rejected: [] }));
+      const outcome = { bodyBytes, attachmentBytes: rawBytes, mimeBytes: 0, batches };
+
+      for (const [index, batch] of plan.entries()) {
+        const message = assembleMessage({ from, subject, batch, content });
+        if (message.length > config.MAIL_MAX_MESSAGE_BYTES) {
+          throw messageTooLarge(message.length, config.MAIL_MAX_MESSAGE_BYTES, bodyBytes, attachments.length + 1);
+        }
+        outcome.mimeBytes = Math.max(outcome.mimeBytes, message.length);
+        const envelope = [...batch.to, ...batch.cc, ...batch.bcc];
+        try {
+          const result = await transport(config, { from, recipients: envelope, message });
+          Object.assign(batches[index], { ok: true, reason: '', rejected: result.rejected });
+          logger.info('mail.batch.sent', {
+            batch: index + 1,
+            of: plan.length,
+            recipients: result.accepted.length,
+            rejected: result.rejected.length,
+            bytes: message.length,
+          });
+        } catch (error) {
+          if (error instanceof AppError) throw error;
+          batches[index].reason = error.message;
+          logger.error('mail.batch.failed', { batch: index + 1, of: plan.length, error: error.message });
+          if (error.fatal) {
+            batches.slice(index + 1).forEach((b) => (b.reason = 'Skipped after a connection failure.'));
+            break;
+          }
+        }
+      }
+      return outcome;
+    },
+  };
+}
+@@END
+@@FILE services/mime.mjs
+import { randomBytes, randomUUID } from 'node:crypto';
+
+const CRLF = '\r\n';
+
+export function base64Lines(buffer) {
+  const encoded = buffer.toString('base64');
+  const lines = [];
+  for (let i = 0; i < encoded.length; i += 76) lines.push(encoded.slice(i, i + 76));
+  return lines.join(CRLF);
+}
+
+/** RFC 2047 encoding for header text that is not plain ASCII. */
+export function encodeHeader(value) {
+  if (/^[\x20-\x7e]*$/.test(value)) return value;
+  const words = [];
+  let current = '';
+  for (const char of value) {
+    if (Buffer.byteLength(current + char) > 42) {
+      words.push(current);
+      current = '';
+    }
+    current += char;
+  }
+  if (current) words.push(current);
+  return words.map((w) => `=?UTF-8?B?${Buffer.from(w).toString('base64')}?=`).join(`${CRLF} `);
+}
+
+const quoted = (value) => `"${encodeHeader(value).replace(/[\\"]/g, '\\$&')}"`;
+
+/** The part of the message shared by every batch: body and attachments. */
+export function composeContent({ text, isHtml, attachments }) {
+  const bodyType = `text/${isHtml ? 'html' : 'plain'}; charset=UTF-8`;
+  const encodedText = base64Lines(Buffer.from(text, 'utf8'));
+
+  if (attachments.length === 0) {
+    return {
+      headers: ['MIME-Version: 1.0', `Content-Type: ${bodyType}`, 'Content-Transfer-Encoding: base64'],
+      body: Buffer.from(encodedText + CRLF, 'latin1'),
+    };
+  }
+
+  const boundary = `=_${randomBytes(12).toString('hex')}`;
+  const parts = [
+    `--${boundary}${CRLF}Content-Type: ${bodyType}${CRLF}Content-Transfer-Encoding: base64${CRLF}${CRLF}${encodedText}${CRLF}`,
+  ];
+  for (const file of attachments) {
+    parts.push(
+      `--${boundary}${CRLF}` +
+        `Content-Type: ${file.contentType}; name=${quoted(file.filename)}${CRLF}` +
+        `Content-Disposition: attachment; filename=${quoted(file.filename)}${CRLF}` +
+        `Content-Transfer-Encoding: base64${CRLF}${CRLF}` +
+        `${base64Lines(file.data)}${CRLF}`,
+    );
+  }
+  parts.push(`--${boundary}--${CRLF}`);
+
+  return {
+    headers: ['MIME-Version: 1.0', `Content-Type: multipart/mixed; boundary="${boundary}"`],
+    body: Buffer.from(parts.join(''), 'latin1'),
+  };
+}
+
+const addressList = (list) => list.join(`,${CRLF} `);
+
+/** Bcc recipients are deliberately absent: they travel only in the SMTP envelope. */
+export function assembleMessage({ from, subject, batch, content }) {
+  const domain = from.split('@')[1];
+  const headers = [
+    `From: ${from}`,
+    `To: ${batch.to.length ? addressList(batch.to) : 'undisclosed-recipients:;'}`,
+    ...(batch.cc.length ? [`Cc: ${addressList(batch.cc)}`] : []),
+    `Subject: ${encodeHeader(subject)}`,
+    `Date: ${new Date().toUTCString().replace('GMT', '+0000')}`,
+    `Message-ID: <${randomUUID()}@${domain}>`,
+    ...content.headers,
+  ];
+  return Buffer.concat([Buffer.from(headers.join(CRLF) + CRLF + CRLF, 'latin1'), content.body]);
+}
+@@END
+@@FILE services/recipients.mjs
+import { AppError } from '../errors.mjs';
+
+const ADDRESS = /^[^\s@<>(),;:"\\]+@[^\s@<>(),;:"\\]+\.[^\s@<>(),;:"\\]+$/;
+
+export function splitAddresses(value) {
+  const parts = Array.isArray(value) ? value : [value ?? ''];
+  return parts
+    .flatMap((part) => String(part).split(/[,;]/))
+    .map((part) => part.trim())
+    .filter(Boolean);
+}
+
+export function isAddress(value) {
+  return value.length <= 254 && ADDRESS.test(value);
+}
+
+/** Splits, validates and de-duplicates (case-insensitive). An address keeps its first role: to, then cc, then bcc. */
+export function collectRecipients({ to, cc, bcc }) {
+  const seen = new Set();
+  const invalid = [];
+  const roles = { to: [], cc: [], bcc: [] };
+
+  for (const [role, raw] of [['to', to], ['cc', cc], ['bcc', bcc]]) {
+    for (const address of splitAddresses(raw)) {
+      if (!isAddress(address)) {
+        invalid.push(address.slice(0, 80));
+        continue;
+      }
+      const key = address.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      roles[role].push(address);
+    }
+  }
+
+  if (invalid.length) {
+    throw new AppError(400, `Invalid recipient address: ${invalid.slice(0, 5).join(', ')}`);
+  }
+  if (seen.size === 0) throw new AppError(400, 'No recipients provided.');
+  return roles;
+}
+
+/** Fills each message up to `size` recipients, in the order to, cc, bcc. */
+export function planBatches({ to, cc, bcc }, size) {
+  const entries = [
+    ...to.map((a) => ['to', a]),
+    ...cc.map((a) => ['cc', a]),
+    ...bcc.map((a) => ['bcc', a]),
+  ];
+  const batches = [];
+  for (let i = 0; i < entries.length; i += size) {
+    const batch = { to: [], cc: [], bcc: [] };
+    for (const [role, address] of entries.slice(i, i + size)) batch[role].push(address);
+    batches.push(batch);
+  }
+  return batches;
+}
+@@END
+@@FILE services/smtp.mjs
+import net from 'node:net';
+import os from 'node:os';
+import tls from 'node:tls';
+import { AppError } from '../errors.mjs';
+
+const CRLF = '\r\n';
+
+export class SmtpError extends Error {
+  constructor(reply) {
+    super(`SMTP ${reply.code}: ${reply.lines.map((l) => l.slice(4)).join(' ').trim()}`);
+    this.name = 'SmtpError';
+    this.code = reply.code;
+  }
+}
+
+/** Connection-level failures: retrying other batches against the same server is pointless. */
+const fatal = (error) => Object.assign(error, { fatal: true });
+
+const megabytes = (bytes) => `${(bytes / 1048576).toFixed(1)} MB`;
+const serverName = (config) => (net.isIP(config.SMTP_HOST) ? undefined : config.SMTP_HOST);
+
+function armTimeout(socket, config) {
+  socket.setTimeout(config.SMTP_TIMEOUT_MS, () =>
+    socket.destroy(fatal(new Error('The mail server did not respond in time.'))),
+  );
+}
+
+function connect(config) {
+  return new Promise((resolve, reject) => {
+    const secure = config.SMTP_SECURE;
+    const socket = secure
+      ? tls.connect({
+          host: config.SMTP_HOST,
+          port: config.SMTP_PORT,
+          servername: serverName(config),
+          rejectUnauthorized: config.SMTP_TLS_REJECT_UNAUTHORIZED,
+        })
+      : net.connect({ host: config.SMTP_HOST, port: config.SMTP_PORT });
+    armTimeout(socket, config);
+    socket.once(secure ? 'secureConnect' : 'connect', () => resolve(socket));
+    socket.once('error', (e) => reject(fatal(e)));
+  });
+}
+
+function upgrade(socket, config) {
+  return new Promise((resolve, reject) => {
+    const secured = tls.connect({
+      socket,
+      servername: serverName(config),
+      rejectUnauthorized: config.SMTP_TLS_REJECT_UNAUTHORIZED,
+    });
+    armTimeout(secured, config);
+    secured.once('secureConnect', () => resolve(secured));
+    secured.once('error', (e) => reject(fatal(e)));
+  });
+}
+
+/** Turns the socket's byte stream into whole SMTP replies (multi-line replies included). */
+function replyReader(socket) {
+  let buffer = '';
+  let lines = [];
+  let failure = null;
+  const replies = [];
+  const waiting = [];
+
+  const settle = () => {
+    while (waiting.length) {
+      if (replies.length) waiting.shift().resolve(replies.shift());
+      else if (failure) waiting.shift().reject(failure);
+      else break;
+    }
+  };
+  const onData = (chunk) => {
+    buffer += chunk;
+    let end;
+    while ((end = buffer.indexOf('\n')) >= 0) {
+      const line = buffer.slice(0, end).replace(/\r$/, '');
+      buffer = buffer.slice(end + 1);
+      lines.push(line);
+      if (/^\d{3}( |$)/.test(line)) {
+        replies.push({ code: Number(line.slice(0, 3)), lines });
+        lines = [];
+      }
+    }
+    settle();
+  };
+  const fail = (error) => {
+    failure ??= fatal(error);
+    settle();
+  };
+
+  socket.setEncoding('utf8');
+  socket.on('data', onData);
+  socket.on('error', fail);
+  socket.on('close', () => fail(new Error('The mail server closed the connection unexpectedly.')));
+
+  return {
+    next: () => new Promise((resolve, reject) => { waiting.push({ resolve, reject }); settle(); }),
+    stop: () => socket.off('data', onData),
+  };
+}
+
+/** Delivers one message to one set of envelope recipients. Returns who was accepted and who was refused. */
+export async function deliver(config, { from, recipients, message }) {
+  let socket = await connect(config);
+  let reader = replyReader(socket);
+  let encrypted = config.SMTP_SECURE;
+  let finished = false;
+
+  const expect = async (...codes) => {
+    const reply = await reader.next();
+    if (!codes.includes(reply.code)) throw new SmtpError(reply);
+    return reply;
+  };
+  const command = async (line, ...codes) => {
+    socket.write(line + CRLF);
+    return expect(...codes);
+  };
+  const ehlo = async () => {
+    const reply = await command(`EHLO ${os.hostname().replace(/[^\w.-]/g, '') || 'localhost'}`, 250);
+    return new Map(
+      reply.lines.slice(1).map((l) => {
+        const [key, ...args] = l.slice(4).trim().split(/\s+/);
+        return [key.toUpperCase(), args];
+      }),
+    );
+  };
+
+  try {
+    await expect(220);
+    let capabilities = await ehlo();
+
+    if (!config.SMTP_SECURE && config.SMTP_STARTTLS && capabilities.has('STARTTLS')) {
+      await command('STARTTLS', 220);
+      reader.stop();
+      socket = await upgrade(socket, config);
+      reader = replyReader(socket);
+      encrypted = true;
+      capabilities = await ehlo();
+    }
+
+    if (config.SMTP_USER) {
+      if (!encrypted) throw new Error('Refusing to send SMTP credentials over an unencrypted connection.');
+      if (!capabilities.has('AUTH')) throw new Error('The mail server does not offer authentication.');
+      const token = Buffer.from(`\0${config.SMTP_USER}\0${config.SMTP_PASSWORD}`).toString('base64');
+      await command(`AUTH PLAIN ${token}`, 235);
+    }
+
+    const declared = Number(capabilities.get('SIZE')?.[0] ?? 0);
+    if (declared && message.length > declared) {
+      throw new AppError(
+        413,
+        `The mail server accepts messages up to ${megabytes(declared)}; this one is ${megabytes(message.length)}.`,
+      );
+    }
+    await command(`MAIL FROM:<${from}>${declared ? ` SIZE=${message.length}` : ''}`, 250);
+
+    const accepted = [];
+    const rejected = [];
+    for (const address of recipients) {
+      socket.write(`RCPT TO:<${address}>${CRLF}`);
+      const reply = await reader.next();
+      if (reply.code === 250 || reply.code === 251) accepted.push(address);
+      else rejected.push({ address, reason: new SmtpError(reply).message });
+    }
+    if (accepted.length === 0) {
+      throw new Error(`The mail server rejected every recipient (${rejected[0].reason}).`);
+    }
+
+    await command('DATA', 354);
+    const stuffed = message.toString('latin1').replace(/(^|\r\n)\./g, '$1..');
+    socket.write(Buffer.from(stuffed.endsWith(CRLF) ? stuffed : stuffed + CRLF, 'latin1'));
+    await command('.', 250);
+
+    finished = true;
+    socket.end(`QUIT${CRLF}`);
+    return { accepted, rejected };
+  } finally {
+    if (!finished) socket.destroy();
+  }
+}
+@@END
+@@FILE tests/mail.test.mjs
+import net from 'node:net';
+import request from 'supertest';
+import { afterEach, describe, expect, it } from 'vitest';
+import { createApp } from '../app.mjs';
+import { loadConfig } from '../config.mjs';
+import { createLogger } from '../logger.mjs';
+import { base64Lines } from '../services/mime.mjs';
+import { collectRecipients, planBatches } from '../services/recipients.mjs';
+
+function startSmtp({ failAttempts = [] } = {}) {
+  const state = { messages: [], connections: 0, attempts: 0 };
+  const server = net.createServer((socket) => {
+    state.connections += 1;
+    socket.setEncoding('utf8');
+    let buffer = '';
+    let inData = false;
+    let from = '';
+    let rcpts = [];
+    const reply = (line) => socket.write(`${line}\r\n`);
+    reply('220 test ESMTP');
+
+    socket.on('data', (chunk) => {
+      buffer += chunk;
+      for (;;) {
+        if (inData) {
+          const end = buffer.indexOf('\r\n.\r\n');
+          if (end < 0) return;
+          const raw = buffer.slice(0, end).replace(/\r\n\.\./g, '\r\n.');
+          buffer = buffer.slice(end + 5);
+          inData = false;
+          const attempt = state.attempts++;
+          if (failAttempts.includes(attempt)) reply('552 mailbox full');
+          else {
+            state.messages.push({ from, rcpts, raw });
+            reply('250 queued');
+          }
+          continue;
+        }
+        const end = buffer.indexOf('\r\n');
+        if (end < 0) return;
+        const line = buffer.slice(0, end);
+        buffer = buffer.slice(end + 2);
+        if (/^EHLO/i.test(line)) socket.write('250-test\r\n250-SIZE 26214400\r\n250 8BITMIME\r\n');
+        else if (/^MAIL FROM:/i.test(line)) {
+          from = line.match(/<(.*)>/)[1];
+          rcpts = [];
+          reply('250 ok');
+        } else if (/^RCPT TO:/i.test(line)) {
+          rcpts.push(line.match(/<(.*)>/)[1]);
+          reply('250 ok');
+        } else if (/^DATA/i.test(line)) {
+          inData = true;
+          reply('354 go');
+        } else if (/^QUIT/i.test(line)) {
+          reply('221 bye');
+          socket.end();
+        } else reply('500 unknown');
+      }
+    });
+    socket.on('error', () => {});
+  });
+  return new Promise((resolve) =>
+    server.listen(0, '127.0.0.1', () => resolve({ server, state, port: server.address().port })),
+  );
+}
+
+describe('notification dispatcher', () => {
+  let smtp;
+
+  afterEach(() => new Promise((resolve) => (smtp ? smtp.server.close(resolve) : resolve())));
+
+  const build = async (smtpOptions = {}, env = {}) => {
+    smtp = await startSmtp(smtpOptions);
+    const config = loadConfig({
+      SMTP_HOST: '127.0.0.1',
+      SMTP_PORT: String(smtp.port),
+      SMTP_STARTTLS: 'false',
+      NOTIFICATION_SENDER: 'noreply@example.com',
+      LOG_LEVEL: 'silent',
+      ...env,
+    });
+    return request(createApp(config, createLogger('silent')));
+  };
+
+
+  const fileOf = (bytes, seed = 7) => Buffer.from(Array.from({ length: bytes }, (_, i) => (i * seed) % 251));
+  const attach = (data, filename = 'test_5mb_file.dat') => ({ filename, encoding: 'base64', content: data.toString('base64') });
+
+  it('splits, validates and de-duplicates recipients, then fills batches in order', () => {
+    const bcc = Array.from({ length: 250 }, (_, i) => `user${i}@example.com`).join(';');
+    const recipients = collectRecipients({ to: 'A@example.com, a@example.com', cc: 'b@example.com', bcc });
+    expect(recipients.to).toEqual(['A@example.com']);
+    expect(planBatches(recipients, 100).map((b) => b.to.length + b.cc.length + b.bcc.length)).toEqual([100, 100, 52]);
+    expect(() => collectRecipients({ to: 'not-an-address' })).toThrow(/Invalid recipient/);
+  });
+
+  it('answers /send-email/v3 with the documented request and response shape', async () => {
+    const api = await build();
+    const data = fileOf(3 * 1024 * 1024 + 786_432); // 3.75 MB of file data, as in the 5 MB base64 test
+    const res = await api.post('/send-email/v3').send({
+      sender: 'noreply@citi.com',
+      receiver: 'pp58386@citi.com',
+      receiverName: 'Paresh',
+      cc: 'pp58386@citi.com',
+      bcc: '',
+      subject: 'Test Email with 5MB Attachment',
+      emailMessage: 'TEST : Your Orion self-service request has been approved. ',
+      attachedFiles: [attach(data)],
+    });
+
+    expect(res.status).toBe(200);
+    expect(Object.keys(res.body)).toEqual([
+      'apiEndpoint', 'emailSender', 'emailReceiver', 'emailCC', 'emailBCC',
+      'emailSubject', 'emailInHtml', 'emailSendResponse', 'emailSuccess', 'batchResults',
+    ]);
+    expect(res.body).toMatchObject({
+      apiEndpoint: '/send-email/v3',
+      emailSender: 'noreply@citi.com',
+      emailReceiver: 'pp58386@citi.com',
+      emailCC: 'pp58386@citi.com',
+      emailBCC: '',
+      emailSubject: 'Test Email with 5MB Attachment',
+      emailInHtml: false,
+      emailSuccess: true,
+    });
+    expect(res.body.emailSendResponse).toMatch(
+      /^All email batches processed successfully\. \[Payload Breakdown: Body: 0\.00MB, Attachments: 3\.75MB, Total Message MIME: 5\.1\dMB\]$/,
+    );
+    expect(res.body.batchResults).toHaveLength(1);
+    expect(res.body.batchResults[0]).toMatchObject({
+      apiEndpoint: '/send-email/v3',
+      emailReceiver: 'pp58386@citi.com',
+      emailCC: '',
+      emailBCC: '',
+      emailSuccess: true,
+    });
+    expect(res.body.batchResults[0].emailSendResponse).toMatch(/^Email batch sent successfully\. \[Payload Breakdown:/);
+
+    const [{ raw, rcpts }] = smtp.state.messages;
+    expect(rcpts).toEqual(['pp58386@citi.com']);
+    expect(raw).toContain('Content-Type: application/octet-stream; name="test_5mb_file.dat"');
+    expect(raw).toContain(base64Lines(data));
+  });
+
+  it('keeps quotes, $, backticks and unicode in an HTML body intact and bcc out of the headers', async () => {
+    const api = await build();
+    const html = '<head><style>.a{color:blue}</style></head><body><h2 class="a">Price: $5 `ok` “quoted”</h2></body>';
+    const res = await api.post('/send-email/v3').send({
+      sender: 'noreply@citi.com',
+      receiver: 'to@example.com',
+      bcc: 'hidden@example.com',
+      subject: 'Résumé ✓',
+      emailMessage: html,
+      isHtml: true,
+      attachedFiles: [attach(fileOf(2000), 'citi1.png')],
+    });
+
+    expect(res.status).toBe(200);
+    expect(res.body.emailInHtml).toBe(true);
+    const [{ raw, rcpts }] = smtp.state.messages;
+    expect(rcpts).toEqual(['to@example.com', 'hidden@example.com']);
+    expect(raw).not.toContain('hidden@example.com');
+    expect(raw).toContain('Content-Type: text/html; charset=UTF-8');
+    expect(raw).toContain(base64Lines(Buffer.from(html)));
+    expect(raw).toContain('Content-Type: image/png; name="citi1.png"');
+    expect(raw).toMatch(/^Subject: =\?UTF-8\?B\?/m);
+  });
+
+  it('delivers 250 recipients as three messages and reports each batch', async () => {
+    const api = await build();
+    const bcc = Array.from({ length: 250 }, (_, i) => `user${i}@example.com`).join(',');
+    const res = await api.post('/send-email/v3').send({ receiver: 'to@example.com', bcc, emailMessage: 'x' });
+
+    expect(res.status).toBe(200);
+    expect(res.body.batchResults).toHaveLength(3);
+    expect(res.body.batchResults.every((b) => b.emailSuccess)).toBe(true);
+    expect(smtp.state.messages.map((m) => m.rcpts.length)).toEqual([100, 100, 51]);
+    expect(new Set(smtp.state.messages.flatMap((m) => m.rcpts)).size).toBe(251);
+    expect(smtp.state.messages[1].raw).toContain('To: undisclosed-recipients:;');
+  });
+
+  it('accepts a 12 MB attachment and refuses 15 MB with a clear 413 before contacting SMTP', async () => {
+    const api = await build();
+    const twelve = fileOf(12 * 1024 * 1024);
+    const ok = await api.post('/send-email/v3').send({ receiver: 'to@example.com', attachedFiles: [attach(twelve)] });
+    expect(ok.status).toBe(200);
+    expect(smtp.state.messages[0].raw).toContain(base64Lines(twelve));
+
+    const connections = smtp.state.connections;
+    const tooBig = await api
+      .post('/send-email/v3')
+      .send({ receiver: 'to@example.com', attachedFiles: [attach(fileOf(15 * 1024 * 1024))] });
+    expect(tooBig.status).toBe(413);
+    expect(tooBig.body.emailSuccess).toBe(false);
+    expect(tooBig.body.emailSendResponse).toMatch(/too large.*limit for one message is 20\.0 MB/);
+    expect(smtp.state.connections).toBe(connections);
+  });
+
+  it('rejects invalid attachments and bad requests in the same response shape', async () => {
+    const api = await build();
+    const bad = await api
+      .post('/send-email/v3')
+      .send({ receiver: 'to@example.com', attachedFiles: [{ filename: 'a.pdf', encoding: 'base64', content: 'not base64!!' }] });
+    expect(bad.status).toBe(400);
+    expect(bad.body.emailSendResponse).toMatch(/not valid base64/);
+
+    const missing = await api.post('/send-email/v3').send({ subject: 'x' });
+    expect(missing.status).toBe(400);
+    expect(missing.body).toMatchObject({ emailSendResponse: 'No recipients provided.', emailSuccess: false });
+    expect(missing.body).not.toHaveProperty('batchResults');
+
+    const injected = await api.post('/send-email/v3').send({ receiver: 'to@example.com', subject: 'a\r\nBcc: evil@example.com' });
+    expect(injected.status).toBe(400);
+
+    const malformed = await api.post('/send-email/v3').set('Content-Type', 'application/json').send('{oops');
+    expect(malformed.status).toBe(400);
+    expect(malformed.body).toHaveProperty('emailSuccess', false);
+    expect(smtp.state.connections).toBe(0);
+  });
+
+  it('reports a failed batch but still delivers the others', async () => {
+    const api = await build({ failAttempts: [1] });
+    const bcc = Array.from({ length: 250 }, (_, i) => `user${i}@example.com`).join(',');
+    const res = await api.post('/send-email/v3').send({ receiver: 'to@example.com', bcc, emailMessage: 'x' });
+
+    expect(res.status).toBe(500);
+    expect(res.body.emailSuccess).toBe(false);
+    expect(res.body.emailSendResponse).toMatch(/Batch 2: SMTP 552/);
+    expect(res.body.batchResults.map((b) => b.emailSuccess)).toEqual([true, false, true]);
+    expect(res.body.batchResults[1].emailSendResponse).toMatch(/^Email batch failed: SMTP 552/);
+    expect(smtp.state.messages).toHaveLength(2);
+  });
+
+  it('answers 401 with the documented body when credentials are configured and wrong', async () => {
+    const api = await build({}, { NOTIFICATION_EMAIL_USERNAME: 'mailer', NOTIFICATION_EMAIL_PASSWORD: 's3cret' });
+    const payload = { sender: 'noreply@citi.com', receiver: 'to@example.com', cc: 'cc@example.com', subject: 'S', emailMessage: 'x' };
+
+    const denied = await api.post('/send-email/v3').send(payload);
+    expect(denied.status).toBe(401);
+    expect(denied.body).toEqual({
+      apiEndpoint: '/send-email/v3',
+      emailSender: 'noreply@citi.com',
+      emailReceiver: 'to@example.com',
+      emailCC: 'cc@example.com',
+      emailBCC: '',
+      emailSubject: 'S',
+      emailInHtml: false,
+      emailSendResponse: 'Authorization failed. Please check your credentials or token.',
+      emailSuccess: false,
+    });
+    expect((await api.post('/send-email/v3').auth('mailer', 'wrong').send(payload)).status).toBe(401);
+    expect((await api.post('/send-email/v3').auth('mailer', 's3cret').send(payload)).status).toBe(200);
+  });
+
+  it('keeps the earlier paths working with the legacy field names', async () => {
+    const api = await build();
+    const res = await api.post('/send-mail/v2').send({ to: 'to@example.com', body: 'hi', subject: 'Old' });
+    expect(res.status).toBe(200);
+    expect(res.body.apiEndpoint).toBe('/send-mail/v2');
+    expect(res.body.emailReceiver).toBe('to@example.com');
+  });
+});
+@@END
+@@CHECKSUMS
+e93c8f81ad705df761fd56f84f0b9f1eb93958300c2bdcff5359ba202771ba64  .env.example
+416988cecf7a9d74c980703e06d13abfe9c2ff4aa6d618ae0de592eb51e42e30  .gitignore
+9dbab8347157e7dd6a74186d383071614fb4cb9483c832cd4e18c7e3b9fad64c  app.mjs
+fc17a57a5f4e62a4bae28e5fc75832514a40605d2ab0c588a858be8ed7c1e8ca  config.mjs
+6ceb94f5e21425f61a8c9ead5c48514229026b8b661baffcc354b4cd67152e34  controllers/mailx.mjs
+db9f6d1f0bf4fea333b4fd691fd4891e636d300a0e8a9f75d70461b764d3569e  controllers/response.mjs
+eae8494900b60a20647728d5ea379ced418d838464c9290b989f99b668eecd80  errors.mjs
+d0dfe3f0abd5631060581bb93fc1daa06575475e234bed6fdc2120d3cb2fbb22  logger.mjs
+62b2cf5889ff15edd82c3fabd926f38742dbb805e2103b13b68db5d60d490335  middleware/basicAuth.mjs
+e16f8d8f2e3def7ed1930240e039cf2f4d00204f80fb30e4a32e5fd6edb13407  package.json
+a8577107454822593c096681c77dcb2a641e535ebd914b4eb66355a5c415bc5b  recreate-app.sh
+89516b6557ba02ad979d4371e733ee1545e8db857bcd09642cd49ca3c10ef190  routes/mailRoutes.mjs
+2716158e40aa547c13304ca8bd6b09678df883a8c63444e55bbca69be70294cb  server.mjs
+8586cff35dbb4ecc9d204ba42ddaada29becb9af04d90ade5c1d1ac5c752ba14  services/attachments.mjs
+5a021360f37f4863f9918daf428f5217c73dd2ed471c8b1956faf04dc3b80613  services/mailer.mjs
+d416dfea05414bcb068ef66d22a67b9fce353e2acf9205a72ebb4c6f6307c314  services/mime.mjs
+878f997b7e09eca6ce8f7c7d2097a1acf766a1381ee1667d390b3eea038c43fc  services/recipients.mjs
+1210a47d7c8a097c7459e77cb7bd14316da5c153dd3cd8836787e83b4324bd39  services/smtp.mjs
+a02784b42236ab2aeda75afa489defed5583b65b0443c50a18247c2d0a7351f1  tests/mail.test.mjs

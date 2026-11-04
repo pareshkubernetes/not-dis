@@ -11,11 +11,10 @@ export function createApp(config, logger, mailer = createMailer(config, logger))
 
   const controller = createMailController({ config, mailer, logger });
   app.get('/healthz', (_req, res) => res.json({ status: 'ok' }));
-  app.use(createMailRouter(controller, basicAuth(config), express.json({ limit: config.MAIL_BODY_LIMIT })));
+  app.use(createMailRouter(controller, express.json({ limit: config.MAIL_BODY_LIMIT }), basicAuth(config)));
 
   app.use((_req, res) => res.status(404).json({ error: 'Not found' }));
 
-  // eslint-disable-next-line no-unused-vars
   app.use((error, req, res, _next) => {
     let status = error.status ?? 500;
     let message = error.message;
@@ -29,7 +28,7 @@ export function createApp(config, logger, mailer = createMailer(config, logger))
       logger.error('http.unhandled', { path: req.path, error: error.message });
       message = 'Unexpected error while sending the email.';
     }
-    res.status(status).json(mailResponse(req.path, req.body, message, false));
+    res.status(status).json(mailResponse(req.path, req.body, config, message, false));
   });
 
   return app;

@@ -32,8 +32,8 @@ const schema = z
     MAIL_BATCH_SIZE: int(100, 1, 300),
     MAIL_MAX_MESSAGE_BYTES: int(20 * MiB, MiB, 25 * MiB),
     MAIL_MAX_ATTACHMENTS: int(10, 1, 20),
-    MAIL_ATTACHMENT_DIR: z.string().default('./attachments'),
-    MAIL_BODY_LIMIT: z.string().default('1mb'),
+    // Attachments travel inside the JSON body as base64 (+33%), so this must exceed MAIL_MAX_MESSAGE_BYTES.
+    MAIL_BODY_LIMIT: z.string().default('30mb'),
   })
   .refine((c) => Boolean(c.SMTP_USER) === Boolean(c.SMTP_PASSWORD), {
     message: 'SMTP_USER and SMTP_PASSWORD must be set together',

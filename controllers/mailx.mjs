@@ -10,6 +10,7 @@ const requestSchema = z.object({
   sender: z.string().trim().optional(),
   receiver: list,
   to: list,
+  receiverName: z.string().optional(),
   cc: list,
   bcc: list,
   subject: z
@@ -18,14 +19,20 @@ const requestSchema = z.object({
     .refine(noLineBreaks, 'must not contain line breaks')
     .optional()
     .transform((v) => v || 'No Subject'),
-  body: z.string().optional(),
   emailMessage: z.string().optional(),
+  body: z.string().optional(),
   isHtml: z
     .union([z.boolean(), z.enum(['true', 'false']).transform((v) => v === 'true')])
     .optional()
     .transform((v) => v ?? false),
-  attachments: z
-    .array(z.union([z.string().min(1), z.object({ path: z.string().min(1) })]))
+  attachedFiles: z
+    .array(
+      z.object({
+        filename: z.string().min(1),
+        encoding: z.literal('base64').optional(),
+        content: z.string().min(1),
+      }),
+    )
     .nullish()
     .transform((v) => v ?? []),
 });
@@ -47,44 +54,61 @@ function parseRequest(body, config) {
     cc: input.cc,
     bcc: input.bcc,
     subject: input.subject,
-    text: input.body ?? input.emailMessage ?? '',
+    text: input.emailMessage ?? input.body ?? '',
     isHtml: input.isHtml,
-    attachments: input.attachments,
+    attachedFiles: input.attachedFiles,
   };
 }
 
-function summarise(outcome) {
-  if (outcome.failures.length === 0 && outcome.rejected.length === 0) {
-    return { ok: true, message: outcome.total > 1 ? 'Email sent successfully in batches.' : 'Email sent successfully.' };
-  }
-  const details = [
-    ...outcome.failures.slice(0, 3).map((f) => `Batch ${f.batch} of ${outcome.total}: ${f.reason}`),
-    ...(outcome.rejected.length
-      ? [
-          `${outcome.rejected.length} recipient(s) rejected by the mail server (${outcome.rejected
-            .slice(0, 5)
-            .map((r) => r.address)
-            .join(', ')})`,
-        ]
-      : []),
-  ];
-  return { ok: false, message: `Some emails failed to send. ${details.join(' | ')}` };
-}
+const megabytes = (bytes) => `${(bytes / 1048576).toFixed(2)}MB`;
 
 export function createMailController({ config, mailer, logger }) {
   return {
     async send(req, res) {
       const endpoint = req.path;
+      const respond = (status, message, success, batchResults) =>
+        res.status(status).json(mailResponse(endpoint, req.body, config, message, success, batchResults));
+
       try {
-        const outcome = await mailer.send(parseRequest(req.body, config));
-        const { ok, message } = summarise(outcome);
-        res.status(ok ? 200 : 500).json(mailResponse(endpoint, req.body, message, ok));
+        const request = parseRequest(req.body, config);
+        const outcome = await mailer.send(request);
+
+        const breakdown =
+          `[Payload Breakdown: Body: ${megabytes(outcome.bodyBytes)}, ` +
+          `Attachments: ${megabytes(outcome.attachmentBytes)}, Total Message MIME: ${megabytes(outcome.mimeBytes)}]`;
+        const failed = outcome.batches.filter((b) => !b.ok || b.rejected.length > 0);
+        const ok = failed.length === 0;
+
+        const batchResults = outcome.batches.map((batch) => {
+          const batchOk = batch.ok && batch.rejected.length === 0;
+          const detail = !batch.ok
+            ? `Email batch failed: ${batch.reason}`
+            : batch.rejected.length
+              ? `Email batch sent, but ${batch.rejected.length} recipient(s) were rejected by the mail server (${batch.rejected
+                  .slice(0, 5)
+                  .map((r) => r.address)
+                  .join(', ')}).`
+              : 'Email batch sent successfully.';
+          return mailResponse(
+            endpoint,
+            { ...req.body, receiver: batch.to, cc: batch.cc, bcc: batch.bcc, subject: request.subject },
+            config,
+            `${detail} ${breakdown}`,
+            batchOk,
+          );
+        });
+
+        const message = ok
+          ? `All email batches processed successfully. ${breakdown}`
+          : `Some email batches failed (${failed.length} of ${outcome.batches.length}). ${failed
+              .slice(0, 3)
+              .map((b) => `Batch ${outcome.batches.indexOf(b) + 1}: ${b.reason || `${b.rejected.length} recipient(s) rejected`}`)
+              .join(' | ')} ${breakdown}`;
+        respond(ok ? 200 : 500, message, ok, batchResults);
       } catch (error) {
-        if (error instanceof AppError) {
-          return res.status(error.status).json(mailResponse(endpoint, req.body, error.message, false));
-        }
+        if (error instanceof AppError) return respond(error.status, error.message, false);
         logger.error('mail.request.failed', { endpoint, error: error.message });
-        res.status(500).json(mailResponse(endpoint, req.body, 'Unexpected error while sending the email.', false));
+        respond(500, 'Unexpected error while sending the email.', false);
       }
     },
   };

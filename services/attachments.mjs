@@ -1,9 +1,9 @@
-import { readFile, realpath, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { AppError } from '../errors.mjs';
 
 const HEADER_ALLOWANCE = 16 * 1024;
 const PART_OVERHEAD = 1024;
+const BASE64 = /^[A-Za-z0-9+/]*={0,2}$/;
 
 const CONTENT_TYPES = {
   '.pdf': 'application/pdf',
@@ -43,54 +43,44 @@ export function messageTooLarge(estimated, limit, bodyBytes, partCount) {
   );
 }
 
-const notFound = (name) => new AppError(400, `Attachment not found: ${String(name).slice(0, 120)}`);
+function cleanFilename(value) {
+  const name = path.basename(String(value).replace(/\\/g, '/')).trim();
+  if (!name || name.length > 255 || /[\x00-\x1f\x7f]/.test(name)) throw new AppError(400, 'Invalid attachment file name.');
+  return name;
+}
 
 /**
- * Resolves attachment names inside MAIL_ATTACHMENT_DIR only, checks the encoded size
- * from file metadata first, and only then reads the files.
+ * Validates the inline base64 attachments and checks the encoded size from the text length alone,
+ * before anything is decoded.
  */
-export async function loadAttachments(requested, config, bodyBytes) {
-  if (requested.length === 0) return [];
-  if (requested.length > config.MAIL_MAX_ATTACHMENTS) {
+export function decodeAttachments(files, config, bodyBytes) {
+  if (files.length === 0) return { attachments: [], rawBytes: 0 };
+  if (files.length > config.MAIL_MAX_ATTACHMENTS) {
     throw new AppError(400, `At most ${config.MAIL_MAX_ATTACHMENTS} attachments are allowed.`);
   }
 
-  let root;
-  try {
-    root = await realpath(path.resolve(config.MAIL_ATTACHMENT_DIR));
-  } catch {
-    throw new AppError(500, 'The attachment directory is not available on the server.');
-  }
-
-  const files = [];
-  for (const entry of requested) {
-    const name = typeof entry === 'string' ? entry : entry.path;
-    let real;
-    try {
-      real = await realpath(path.resolve(root, name));
-    } catch {
-      throw notFound(name);
+  const prepared = files.map((file) => {
+    const filename = cleanFilename(file.filename);
+    const content = file.content.replace(/\s+/g, '');
+    if (content.length % 4 !== 0 || !BASE64.test(content)) {
+      throw new AppError(400, `Attachment "${filename.slice(0, 120)}" is not valid base64.`);
     }
-    const relative = path.relative(root, real);
-    if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) throw notFound(name);
-    const info = await stat(real);
-    if (!info.isFile()) throw notFound(name);
-    files.push({ real, filename: path.basename(name), size: info.size });
-  }
+    const padding = content.endsWith('==') ? 2 : content.endsWith('=') ? 1 : 0;
+    return { filename, content, size: (content.length / 4) * 3 - padding };
+  });
 
   const estimated =
     HEADER_ALLOWANCE +
     encodedSize(bodyBytes) +
-    files.reduce((sum, f) => sum + encodedSize(f.size) + PART_OVERHEAD, 0);
+    prepared.reduce((sum, f) => sum + encodedSize(f.size) + PART_OVERHEAD, 0);
   if (estimated > config.MAIL_MAX_MESSAGE_BYTES) {
-    throw messageTooLarge(estimated, config.MAIL_MAX_MESSAGE_BYTES, bodyBytes, files.length + 1);
+    throw messageTooLarge(estimated, config.MAIL_MAX_MESSAGE_BYTES, bodyBytes, prepared.length + 1);
   }
 
-  return Promise.all(
-    files.map(async (f) => ({
-      filename: f.filename,
-      contentType: CONTENT_TYPES[path.extname(f.filename).toLowerCase()] ?? 'application/octet-stream',
-      data: await readFile(f.real),
-    })),
-  );
+  const attachments = prepared.map((f) => ({
+    filename: f.filename,
+    contentType: CONTENT_TYPES[path.extname(f.filename).toLowerCase()] ?? 'application/octet-stream',
+    data: Buffer.from(f.content, 'base64'),
+  }));
+  return { attachments, rawBytes: attachments.reduce((sum, a) => sum + a.data.length, 0) };
 }
