@@ -11,7 +11,7 @@ export function createApp(config, logger, mailer = createMailer(config, logger))
 
   const controller = createMailController({ config, mailer, logger });
   app.get('/healthz', (_req, res) => res.json({ status: 'ok' }));
-  app.use(createMailRouter(controller, express.json({ limit: config.MAIL_BODY_LIMIT }), basicAuth(config)));
+  app.use(createMailRouter(controller, express.json({ limit: config.MAIL_BODY_LIMIT }), basicAuth(config, logger)));
 
   app.use((_req, res) => res.status(404).json({ error: 'Not found' }));
 
