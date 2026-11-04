@@ -13,7 +13,7 @@ const int = (fallback, min, max) => z.coerce.number().int().min(min).max(max).de
 const schema = z
   .object({
     NODE_ENV: z.string().default('development'),
-    PORT: int(3000, 1, 65535),
+    PORT: int(3042, 1, 65535),
     LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error', 'silent']).default('info'),
 
     NOTIFICATION_EMAIL_USERNAME: z.string().optional(),

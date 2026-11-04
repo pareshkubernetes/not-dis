@@ -4,11 +4,16 @@ import { createApp } from './app.mjs';
 import { loadConfig } from './config.mjs';
 import { createLogger } from './logger.mjs';
 
-// A .env file, when present, wins over variables already set in the shell or the operating system.
+// On a developer machine a .env file wins over variables already set in the shell or the operating system.
+// Inside a Kubernetes/OpenShift pod the platform's environment variables win, as they should.
+const inCluster = Boolean(process.env.KUBERNETES_SERVICE_HOST);
 const overridden = [];
 if (existsSync('.env')) {
   for (const [key, value] of Object.entries(parseEnv(readFileSync('.env', 'utf8')))) {
-    if (process.env[key] !== undefined && process.env[key] !== value) overridden.push(key);
+    if (process.env[key] !== undefined) {
+      if (inCluster || process.env[key] === value) continue;
+      overridden.push(key);
+    }
     process.env[key] = value;
   }
 }

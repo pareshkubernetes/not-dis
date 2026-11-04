@@ -259,5 +259,6 @@ describe('notification dispatcher', () => {
     expect(res.status).toBe(200);
     expect(res.body.apiEndpoint).toBe('/send-mail/v2');
     expect(res.body.emailReceiver).toBe('to@example.com');
+    expect((await api.get('/health')).body).toEqual({ status: 'ok' });
   });
 });

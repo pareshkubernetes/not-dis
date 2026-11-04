@@ -10,7 +10,8 @@ export function createApp(config, logger, mailer = createMailer(config, logger))
   app.disable('x-powered-by');
 
   const controller = createMailController({ config, mailer, logger });
-  app.get('/healthz', (_req, res) => res.json({ status: 'ok' }));
+  // `/health` is what the Helm liveness and readiness probes call.
+  app.get(['/health', '/healthz'], (_req, res) => res.json({ status: 'ok' }));
   app.use(createMailRouter(controller, express.json({ limit: config.MAIL_BODY_LIMIT }), basicAuth(config, logger)));
 
   app.use((_req, res) => res.status(404).json({ error: 'Not found' }));
