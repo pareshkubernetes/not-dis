@@ -174,6 +174,10 @@ describe('notification dispatcher', () => {
   it('keeps quotes, $, backticks and unicode in an HTML body intact and bcc out of the headers', async () => {
     const api = await build();
     const html = '<head><style>.a{color:blue}</style></head><body><h2 class="a">Price: $5 `ok` “quoted”</h2></body>';
+    // A caller that spells the file name `fileName` and uses a long name with spaces and brackets.
+    const emlName = '_CTI JIRA_ RFP _ Release For Production for (RHDH) RedHat Developer Hub - 1.8.5 - Maintenance.eml';
+    const emlData = fileOf(3000);
+    const eml = { fileName: emlName, encoding: 'BASE64', content: emlData.toString('base64') };
     const res = await api.post('/send-email/v3').send({
       sender: 'noreply@citi.com',
       receiver: 'to@example.com',
@@ -181,11 +185,13 @@ describe('notification dispatcher', () => {
       subject: 'Résumé ✓',
       emailMessage: html,
       isHtml: true,
-      attachedFiles: [attach(fileOf(2000), 'citi1.png')],
+      attachedFiles: [attach(fileOf(2000), 'citi1.png'), eml],
     });
 
     expect(res.status).toBe(200);
     expect(res.body.emailInHtml).toBe(true);
+    expect(smtp.state.messages[0].raw).toContain(`filename="${emlName}"`);
+    expect(smtp.state.messages[0].raw).toContain(base64Lines(emlData));
     const [{ raw, rcpts }] = smtp.state.messages;
     expect(rcpts).toEqual(['to@example.com', 'hidden@example.com']);
     expect(raw).not.toContain('hidden@example.com');
@@ -338,5 +344,25 @@ describe('notification dispatcher', () => {
     expect(res.body.apiEndpoint).toBe('/send-mail/v2');
     expect(res.body.emailReceiver).toBe('to@example.com');
     expect((await api.get('/health')).body).toEqual({ status: 'ok' });
+
+    // Assure's payload: `attachments` with `fileName`, `contentType` and base64 `content`, recipients joined by ';'.
+    const pdf = Buffer.from('%PDF-1.4 sample');
+    const assure = await api.post('/send-mail/v2').send({
+      sender: 'noreply@citi.com',
+      receiver: 'a@example.com;b@example.com',
+      greeting: 'Hello',
+      receiverName: 'A',
+      cc: '',
+      bcc: '',
+      subject: 'CVE status',
+      emailMessage: '<p>report</p>',
+      isHtml: true,
+      attachments: [{ fileName: 'Security Fix (5 CVEs).pdf', contentType: 'application/pdf', content: pdf.toString('base64') }],
+    });
+    expect(assure.status).toBe(200);
+    const sent = smtp.state.messages.at(-1);
+    expect(sent.rcpts).toEqual(['a@example.com', 'b@example.com']);
+    expect(sent.raw).toContain('Content-Type: application/pdf; name="Security Fix (5 CVEs).pdf"');
+    expect(sent.raw).toContain(base64Lines(pdf));
   });
 });

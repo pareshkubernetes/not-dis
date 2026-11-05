@@ -9,6 +9,24 @@ const DEFAULT_MESSAGE = 'This is auto-generated email from Orion as acknowledgem
 const list = z.union([z.string(), z.array(z.string())]).optional();
 const noLineBreaks = (value) => !/[\r\n]/.test(value);
 
+// Callers spell the file name `filename`, `fileName` or `name`; the data is always inline base64 in `content`.
+const attachment = z.preprocess(
+  (file) => {
+    if (!file || typeof file !== 'object') return file;
+    return {
+      filename: file.filename ?? file.fileName ?? file.name,
+      encoding: typeof file.encoding === 'string' ? file.encoding.toLowerCase() : undefined,
+      content: file.content,
+    };
+  },
+  z.object({
+    filename: z.string().min(1),
+    encoding: z.literal('base64').optional(),
+    content: z.string().min(1),
+  }),
+);
+const attachmentList = z.array(attachment).nullish();
+
 const requestSchema = z.object({
   sender: z.string().trim().optional(),
   receiver: list,
@@ -28,16 +46,8 @@ const requestSchema = z.object({
     .union([z.boolean(), z.enum(['true', 'false']).transform((v) => v === 'true')])
     .optional()
     .transform((v) => v ?? false),
-  attachedFiles: z
-    .array(
-      z.object({
-        filename: z.string().min(1),
-        encoding: z.literal('base64').optional(),
-        content: z.string().min(1),
-      }),
-    )
-    .nullish()
-    .transform((v) => v ?? []),
+  attachedFiles: attachmentList,
+  attachments: attachmentList,
 });
 
 function parseRequest(body, config) {
@@ -58,7 +68,7 @@ function parseRequest(body, config) {
     subject: input.subject,
     text: input.emailMessage || input.body || DEFAULT_MESSAGE,
     isHtml: input.isHtml,
-    attachedFiles: input.attachedFiles,
+    attachedFiles: input.attachedFiles ?? input.attachments ?? [],
   };
 }
 
